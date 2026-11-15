@@ -18,21 +18,17 @@ Variabili d'ambiente (.env in locale, GitHub Secrets su Actions):
 """
 
 import html
-import json
 import logging
 import math
 import os
 import re
-import smtplib
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-import firebase_admin
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
-from firebase_admin import credentials, firestore
+from firestore_client import init_firestore, get_collection, close_firestore
+from email_client import send_email
 
 load_dotenv()
 
@@ -40,8 +36,6 @@ load_dotenv()
 EMAIL_MITTENTE = os.getenv("EMAIL_MITTENTE")
 EMAIL_DESTINATARIO = os.getenv("EMAIL_DESTINATARIO")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")  # Da GitHub Secrets
-FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")
-FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
 COLLECTION = "benchmarks"
 TOP_N = 10
@@ -53,21 +47,6 @@ RE_COLORE = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})")  # es. #009246 opp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-
-# ─── FIRESTORE ───────────────────────────────────────────────────────────────
-def init_firestore():
-    if FIREBASE_CREDENTIALS_JSON:
-        cred = credentials.Certificate(json.loads(FIREBASE_CREDENTIALS_JSON))
-    elif FIREBASE_CREDENTIALS:
-        cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-    else:
-        raise RuntimeError(
-            "Imposta FIREBASE_CREDENTIALS (percorso) o FIREBASE_CREDENTIALS_JSON (contenuto)."
-        )
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-    return firestore.client()
 
 
 def _attivo(valore) -> bool:
@@ -82,29 +61,28 @@ def _attivo(valore) -> bool:
 def carica_benchmarks(db) -> list[dict]:
     """Legge tutti i documenti di "benchmarks": id, titolo, colore e ticker di ogni indice attivo."""
     benchmarks = []
-    for doc in db.collection(COLLECTION).stream():
-        d = doc.to_dict()
+    for ref, d in get_collection(db, COLLECTION):
         if not _attivo(d.get("active")):
-            log.info("%s: active=false, saltato", doc.id)
+            log.info("%s: active=false, saltato", ref.id)
             continue
 
         tickers = list(dict.fromkeys(
             t.strip().upper() for t in d.get("tickers", []) if t and t.strip()
         ))
         if not tickers:
-            log.warning("%s: campo 'tickers' vuoto o mancante, saltato", doc.id)
+            log.warning("%s: campo 'tickers' vuoto o mancante, saltato", ref.id)
             continue
 
         colore = str(d.get("color") or "").strip()
         if not RE_COLORE.fullmatch(colore):
             if colore:
-                log.warning("%s: colore '%s' non valido (atteso es. #009246), uso il nero", doc.id, colore)
+                log.warning("%s: colore '%s' non valido (atteso es. #009246), uso il nero", ref.id, colore)
             colore = COLORE_DEFAULT
 
-        log.info("%s: %d ticker letti da Firestore", doc.id, len(tickers))
+        log.info("%s: %d ticker letti da Firestore", ref.id, len(tickers))
         benchmarks.append({
-            "id": doc.id,
-            "label": str(d.get("name") or doc.id).replace("_", " "),
+            "id": ref.id,
+            "label": str(d.get("name") or ref.id).replace("_", " "),
             "color": colore,
             "tickers": tickers,
         })
@@ -227,15 +205,10 @@ def build_html_table(df: pd.DataFrame, index_name: str, color: str) -> str:
     </div>"""
 
 
-def send_email(html_content: str):
-    """Invia l'email tramite Gmail SMTP."""
+def send_email_full(html_content: str):
+    """Invia l'email tramite Gmail SMTP."""    
     today = datetime.today().strftime("%d/%m/%Y")
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"📉 Report Settimanale Peggiori Performer — {today}"
-    msg["From"] = EMAIL_MITTENTE
-    msg["To"] = EMAIL_DESTINATARIO
-
+    subject = f"📉 Report Settimanale Peggiori Performer — {today}"
     html_full = f"""
     <html><body style="font-family:Arial,sans-serif; max-width:700px; margin:auto; padding:20px; color:#333;">
         <h1 style="text-align:center; color:#222;">📊 Report Settimanale</h1>
@@ -249,12 +222,7 @@ def send_email(html_content: str):
         </p>
     </body></html>
     """
-    msg.attach(MIMEText(html_full, "html"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-        server.login(EMAIL_MITTENTE, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
-    log.info("✅ Email inviata con successo!")
+    send_email(subject,html_full)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -271,17 +239,20 @@ def main():
 
     db = init_firestore()
 
-    html_tables = ""
-    for bm in carica_benchmarks(db):
-        df = get_weekly_performance(bm["tickers"], bm["label"])
-        if df.empty:
-            continue
-        html_tables += build_html_table(aggiungi_dettagli(df), bm["label"], bm["color"])
+    try:
+        html_tables = ""
+        for bm in carica_benchmarks(db):
+            df = get_weekly_performance(bm["tickers"], bm["label"])
+            if df.empty:
+                continue
+            html_tables += build_html_table(aggiungi_dettagli(df), bm["label"], bm["color"])
 
-    if html_tables:
-        send_email(html_tables)
-    else:
-        log.error("❌ Nessun dato disponibile. Email non inviata.")
+        if html_tables:
+            send_email_full(html_tables)
+        else:
+            log.error("❌ Nessun dato disponibile. Email non inviata.")
+    finally:
+        close_firestore()
 
 
 if __name__ == "__main__":
